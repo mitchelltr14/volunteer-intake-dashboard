@@ -2,6 +2,7 @@
 
 Structured volunteer questionnaire -> Claude-powered role matching ->
 coordinator review -> searchable Volunteer Directory with welcome emails.
+Also: Quick Add parses unstructured sign-up messages (emails, texts, forms).
 
 Run with:  streamlit run app.py
 """
@@ -148,6 +149,44 @@ Rules:
 - Do not invent facts that are not in the questionnaire."""
 
 
+# Free-text sign-up message parsing (Quick Add tab).
+SAMPLE_MESSAGE = (
+    "Hi there! My name is Jordan Lee and I saw your post about needing help at "
+    "the food pantry. I'm a retired teacher, great with organizing, and I've "
+    "done a lot of spreadsheet work. I also speak some Mandarin. I'm free most "
+    "Tuesday and Thursday mornings and the occasional Saturday. I'd love to help "
+    "with sorting donations or keeping your records tidy. You can reach me at "
+    "jordan.lee@example.com. Thanks!"
+)
+
+MESSAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "skills": {"type": "array", "items": {"type": "string"}},
+        "availability": {"type": "string"},
+        "preferred_role": {"type": "string"},
+        "draft_welcome_email": {"type": "string"},
+    },
+    "required": ["name", "skills", "availability", "preferred_role", "draft_welcome_email"],
+    "additionalProperties": False,
+}
+
+MESSAGE_SYSTEM_PROMPT = f"""You are a volunteer coordinator assistant for a community nonprofit.
+Extract a volunteer profile from an unstructured sign-up message (email, text or form).
+
+Rules:
+- name: the volunteer's full name, or "Unknown" if not given.
+- skills: short skill phrases taken from the message.
+- availability: one short sentence summarizing when they can help.
+- preferred_role: the role they asked for, otherwise the best fit from:
+  {", ".join(ROLE_CATALOG)}.
+- draft_welcome_email: a warm, personalized email (subject line first, then body,
+  under 200 words) that references their specific skills and availability.
+  Sign off as "The Volunteer Team".
+- Do not invent facts that are not in the message."""
+
+
 # ---------------------------------------------------------------------------
 # State & helpers
 # ---------------------------------------------------------------------------
@@ -220,8 +259,8 @@ def validate(responses: dict) -> list[str]:
 # Claude evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_volunteer(api_key: str, responses: dict) -> dict:
-    """Send the questionnaire to Claude and return the parsed profile dict.
+def call_claude(api_key: str, system: str, content: str, schema: dict) -> dict:
+    """Send one request to Claude and return its JSON output as a dict.
 
     Raises RuntimeError with a user-friendly message on any failure.
     """
@@ -230,15 +269,11 @@ def evaluate_volunteer(api_key: str, responses: dict) -> dict:
         response = client.beta.messages.create(
             model=MODEL,
             max_tokens=16000,
-            system=SYSTEM_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": "Volunteer questionnaire (JSON):\n"
-                + json.dumps(responses, indent=2),
-            }],
+            system=system,
+            messages=[{"role": "user", "content": content}],
             output_config={
                 "effort": "low",
-                "format": {"type": "json_schema", "schema": PROFILE_SCHEMA},
+                "format": {"type": "json_schema", "schema": schema},
             },
             # If a safety classifier declines, the API retries on a fallback model.
             betas=["server-side-fallback-2026-07-01"],
@@ -254,19 +289,42 @@ def evaluate_volunteer(api_key: str, responses: dict) -> dict:
         raise RuntimeError("Could not reach the Anthropic API — check your connection.")
 
     if response.stop_reason == "refusal":
-        raise RuntimeError("The model declined to evaluate this questionnaire.")
+        raise RuntimeError("The model declined to process this request.")
     if response.stop_reason == "max_tokens":
         raise RuntimeError("The response was cut off before completing. Please retry.")
 
     text = next((b.text for b in response.content if b.type == "text"), "")
     try:
-        profile = json.loads(text)
+        data = json.loads(text)
     except json.JSONDecodeError:
         raise RuntimeError("Could not parse the model's response as JSON. Please retry.")
-    missing = [k for k in PROFILE_SCHEMA["required"] if k not in profile]
+    if not isinstance(data, dict):
+        raise RuntimeError("The model's response was not a JSON object. Please retry.")
+    missing = [k for k in schema["required"] if k not in data]
     if missing:
         raise RuntimeError(f"Model response is missing fields: {', '.join(missing)}")
-    return profile
+    return data
+
+
+def evaluate_volunteer(api_key: str, responses: dict) -> dict:
+    """Questionnaire -> full profile with matched roles."""
+    content = "Volunteer questionnaire (JSON):\n" + json.dumps(responses, indent=2)
+    return call_claude(api_key, SYSTEM_PROMPT, content, PROFILE_SCHEMA)
+
+
+def extract_from_message(api_key: str, message: str) -> dict:
+    """Free-text sign-up message -> directory entry (same shape as questionnaire profiles)."""
+    data = call_claude(api_key, MESSAGE_SYSTEM_PROMPT, f"Sign-up message:\n{message}", MESSAGE_SCHEMA)
+    return {
+        "name": data["name"],
+        "contact": "",
+        "preferred_channel": "—",
+        "skills_summary": [{"area": s, "level": "", "note": ""} for s in data["skills"]],
+        "availability_summary": data["availability"],
+        "matched_roles": [],
+        "preferred_role": data["preferred_role"],
+        "draft_welcome_email": data["draft_welcome_email"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +401,35 @@ def render_review(profile: dict) -> None:
         st.rerun()
 
 
+def render_quick_add(api_key: str | None) -> None:
+    """Paste an unstructured sign-up message and add the parsed volunteer directly."""
+    st.header("Quick Add from Sign-up Message")
+    st.caption("Paste an email, text or form submission. Claude extracts the details.")
+    message = st.text_area("Volunteer message", placeholder=SAMPLE_MESSAGE, height=180)
+    if st.button("➕ Extract & Add Volunteer", type="primary"):
+        if not message.strip():
+            st.error("Paste a volunteer message first.")
+        elif not api_key:
+            st.error("Add an Anthropic API key in the sidebar (or in .streamlit/secrets.toml).")
+        else:
+            with st.spinner("Extracting volunteer details…"):
+                try:
+                    profile = extract_from_message(api_key, message)
+                except RuntimeError as e:
+                    st.error(str(e))
+                    return
+            st.session_state.directory.append(profile)
+            st.success(f"{profile['name']} added to the directory. See the Directory tab.")
+
+
+def format_skills(skills: list[dict]) -> str:
+    """'Area (Level)' for questionnaire skills; plain text for message-extracted skills."""
+    return "; ".join(
+        f"{s['area']} ({s['level'].split(' /')[0]})" if s.get("level") else s["area"]
+        for s in skills
+    )
+
+
 def directory_frame(directory: list[dict]) -> pd.DataFrame:
     return pd.DataFrame([
         {
@@ -350,7 +437,7 @@ def directory_frame(directory: list[dict]) -> pd.DataFrame:
             "Contact": p["contact"],
             "Channel": p["preferred_channel"],
             "Preferred Role": p["preferred_role"],
-            "Skills": "; ".join(f"{s['area']} ({s['level'].split(' /')[0]})" for s in p["skills_summary"]),
+            "Skills": format_skills(p["skills_summary"]),
             "Availability": p["availability_summary"],
         }
         for p in directory
@@ -390,12 +477,17 @@ def render_directory() -> None:
         filtered.index,
         format_func=lambda i: f"{directory[i]['name']} — {directory[i]['preferred_role']}",
     )
+    volunteer = directory[idx]
+    # Edits are saved back to the directory entry as you type.
+    volunteer["draft_welcome_email"] = st.text_area(
+        "Edit email", volunteer["draft_welcome_email"], height=260, key=f"email_edit_{idx}"
+    )
     # st.code provides a one-click copy button in its top-right corner.
-    st.code(directory[idx]["draft_welcome_email"], language=None, wrap_lines=True)
+    st.code(volunteer["draft_welcome_email"], language=None, wrap_lines=True)
     st.download_button(
         "Download as .txt",
-        directory[idx]["draft_welcome_email"],
-        file_name=f"welcome_{directory[idx]['name'].replace(' ', '_').lower()}.txt",
+        volunteer["draft_welcome_email"],
+        file_name=f"welcome_{volunteer['name'].replace(' ', '_').lower()}.txt",
     )
 
 
@@ -412,7 +504,12 @@ def main() -> None:
     api_key = get_api_key()
     st.sidebar.metric("Volunteers in directory", len(st.session_state.directory))
 
-    tab_intake, tab_directory = st.tabs(["📝 Intake & Matching", "📇 Directory"])
+    tab_intake, tab_quick, tab_directory = st.tabs(
+        ["📝 Intake & Matching", "✉️ Quick Add from Message", "📇 Directory"]
+    )
+
+    with tab_quick:
+        render_quick_add(api_key)
 
     with tab_intake:
         if render_questionnaire():
